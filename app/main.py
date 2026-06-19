@@ -37,7 +37,6 @@ class GatewayResponse(BaseModel):
     user_prompt: str
     llm_response: Dict[str, Any]
 
-
 # --- CORE ROUTING PLUMBING ---
 
 @app.get("/health")

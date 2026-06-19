@@ -30,3 +30,24 @@ By anchoring dependency installation entirely within default upstream Ubuntu ser
 
 Deterministic Build Reproducibility
 The reliance on an explicit manifest (requirements.txt) with strict semantic version locking (==) protects the proxy from breaking due to downstream updates. This configuration allows automated continuous integration (CI/CD) systems and secondary developers to rebuild identical local execution environments with a single command, eliminating configuration drift.
+
+
+PHASE 2 Dockerized Vector Engine : comands 
+
+sudo apt update
+
+Bash
+sudo apt install docker.io docker-compose-v2 -y
+
+Bash
+sudo usermod -aG docker $USER
+(Note: Close your terminal window completely and open a fresh tab at this point to apply permissions). 
+
+Bash
+cd ~/Projects/semantic_api_gateway
+
+Bash
+docker compose up -d
+
+Bash
+docker ps
