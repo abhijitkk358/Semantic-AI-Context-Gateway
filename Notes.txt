@@ -1,11 +1,12 @@
 Development Log: Phase 1 — Environment Initialization
+
 This log covers the setup requirements and configuration strategies implemented to establish a secure and deterministic development runtime within the Windows Subsystem for Linux (WSL) ecosystem.
 
 Technical Specifications & Commands Run
 1. Synchronize Package Repositories
 Bash
 sudo apt update
-Description: Requests the latest metadata and dependency manifests from the official upstream Ubuntu distribution registries.
+Description: Requests the metadata and dependency manifests from the official upstream Ubuntu distribution registries.
 
 Architectural Justification: This step updates local package definitions prior to downloading system-level dependencies. It ensures that the operating system pulls patches and accurate version mapping directly from audo
 ited upstream sources.
@@ -25,7 +26,6 @@ Description: Restricts application engine setups specifically to definitions bou
 Architectural Justification: Modern Linux frameworks implement isolation barriers under PEP 668 specifications to block global script modifications that might clash with OS processes. Utilizing the --break-system-packages flag bypasses this localized trap. This choice is valid here because the architecture will ultimately deploy into isolated, single-concern Docker containers, neutralizing the risk of shared dependency friction on the host runtime.
 
 Production Security and Architecture Focus
-Supply-Chain Security Integrity
 By anchoring dependency installation entirely within default upstream Ubuntu servers via apt, all foundational binary signatures undergo cryptographic verification against Canonical’s embedded public keys. This strategy prevents unauthorized execution, intercepting malware injection routes before third-party code enters the system path.
 
 Deterministic Build Reproducibility
