@@ -15,15 +15,16 @@ class Settings(BaseSettings):
     hnsw_m: int = 16
     hnsw_ef_construction: int = 200
 
-    # Semantic deduplication threshold.
-    # Stored embeddings use COSINE *distance* (0.0 = identical, 2.0 = opposite).
-    # We keep a sentence only when its nearest neighbour distance > this value.
-    # 0.15 ≈ cosine *similarity* of 0.85, a conservative duplicate boundary.
+    # Semantic deduplication threshold (cosine distance)
     similarity_threshold: float = 0.15
 
     # TTL for cached embeddings (seconds)
     context_ttl_seconds: int = 600
 
+    # Gemini API
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+    gemini_base_url: str = "https://api.groq.com/openai/v1/"
     class Config:
         env_file = ".env"
 
