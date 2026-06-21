@@ -1,11 +1,16 @@
 """
-Semantic AI Context Gateway — main.py
-======================================
-Phase 2: Added Gemini SSE streaming proxy.
-- POST /v1/chat/completions  → compacts prompt + streams Gemini response
-- POST /v1/stream/completions → direct streaming endpoint
-- GET  /v1/stream/health      → Gemini API key status
-- GET  /health                → Redis + model status
+Semantic AI Context Gateway — main.py  v2.1.0
+===============================================
+Production fixes in this version:
+1. Per-session Redis namespacing  — session_id isolates each user's cache
+2. Stricter similarity threshold  — 0.05 distance, only near-exact duplicates
+3. Short sentence bypass          — sentences under min_sentence_length always kept
+4. Sliding TTL                    — cache expiry resets on every cache hit
+5. Empty compaction fallback      — always sends something to LLM
+6. Auto retry on 429              — handled in stream.py
+7. Request ID tracing             — UUID on every request for log correlation
+8. Better sentence splitter       — handles ? ! . and newlines correctly
+9. Dropped sentences tracked      — passed to LLM metadata for token savings calc
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from functools import partial
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, List, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -31,7 +36,7 @@ from redis.commands.search.query import Query
 from sentence_transformers import SentenceTransformer
 
 from app.config import settings
-from app.routers.stream import StreamRequest, gemini_stream, router as stream_router
+from app.routers.stream import StreamRequest, groq_stream, router as stream_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -44,7 +49,7 @@ log = logging.getLogger("semantic_gateway")
 
 
 # ---------------------------------------------------------------------------
-# Application-level singletons
+# App state singletons
 # ---------------------------------------------------------------------------
 class AppState:
     model: Optional[SentenceTransformer] = None
@@ -55,13 +60,12 @@ app_state = AppState()
 
 
 # ---------------------------------------------------------------------------
-# Redis index management
+# Redis index
 # ---------------------------------------------------------------------------
 def ensure_redis_index(r: Redis) -> None:
     idx = settings.index_name
     expected_dim = settings.vector_dim
     expected_metric = settings.distance_metric.upper()
-
     needs_create = False
 
     try:
@@ -69,6 +73,7 @@ def ensure_redis_index(r: Redis) -> None:
         attrs = info.get("attributes", [])
         current_dim: Optional[int] = None
         current_metric: Optional[str] = None
+
         for attr in attrs:
             if isinstance(attr, (list, tuple)):
                 attr_dict = {}
@@ -119,6 +124,7 @@ def ensure_redis_index(r: Redis) -> None:
 
     schema = (
         TagField("sentence_id"),
+        TagField("session_id"),
         TextField("text"),
         VectorField(
             "embedding",
@@ -151,7 +157,7 @@ def ensure_redis_index(r: Redis) -> None:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("=== Semantic Gateway Startup ===")
+    log.info("=== Semantic Gateway Startup v2.1.0 ===")
 
     loop = asyncio.get_running_loop()
     log.info("Loading SentenceTransformer model '%s' ...", settings.model_name)
@@ -168,8 +174,12 @@ async def lifespan(app: FastAPI):
 
     ensure_redis_index(r)
 
-    log.info("Gemini model: %s", settings.gemini_model)
-    log.info("Gemini API key set: %s", bool(settings.gemini_api_key))
+    log.info("LLM model     : %s", settings.groq_model)
+    log.info("LLM base URL  : %s", settings.groq_base_url)
+    log.info("API key set   : %s", bool(settings.groq_api_key))
+    log.info("Threshold     : %.3f (cosine distance)", settings.similarity_threshold)
+    log.info("Min sent len  : %d chars", settings.min_sentence_length)
+    log.info("Cache TTL     : %ds (sliding)", settings.context_ttl_seconds)
     log.info("=== Startup complete. Gateway is ready. ===")
     yield
 
@@ -183,41 +193,51 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Semantic AI Context Gateway",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
-# Register streaming router
 app.include_router(stream_router)
 
 
 # ---------------------------------------------------------------------------
-# Pydantic schemas
+# Schemas
 # ---------------------------------------------------------------------------
 class ChatCompletionRequest(BaseModel):
-    prompt: str = Field(..., description="Multi-sentence prompt to compact then stream.")
-    temperature: float = Field(0.7, ge=0.0, le=2.0)
-    stream: bool = Field(True, description="Stream response via SSE (default: True)")
+    prompt: str            = Field(..., description="Prompt to compact and send.")
+    temperature: float     = Field(0.7, ge=0.0, le=2.0)
+    stream: bool           = Field(True, description="Stream via SSE if True.")
+    # FIX 1: per-user session isolation
+    session_id: str        = Field("default", description="Unique user/session ID.")
 
 
 class ChatCompletionResponse(BaseModel):
+    request_id: str
+    session_id: str
     gateway_status: str
     original_chars: int
     transmitted_chars: int
     savings_percentage: float
-    latency_ms: float
+    compaction_latency_ms: float
     final_prompt_sent: str
 
 
 # ---------------------------------------------------------------------------
-# Text utilities
+# FIX 8: Better sentence splitter
+# Handles . ! ? and newlines, keeps punctuation attached
 # ---------------------------------------------------------------------------
-_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=\n)")
+_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
 def split_sentences(text: str) -> List[str]:
     raw = _SPLIT_RE.split(text.strip())
-    return [s.strip() for s in raw if s.strip()]
+    cleaned = []
+    for s in raw:
+        s = s.strip()
+        if not s:
+            continue
+        cleaned.append(s)
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -240,36 +260,62 @@ def vec_to_bytes(vec: np.ndarray) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Redis helpers
+# FIX 1: Session-scoped Redis key
+# Each session gets its own namespace — no cross-user cache collisions
 # ---------------------------------------------------------------------------
-def redis_key(sentence: str) -> str:
+def redis_key(sentence: str, session_id: str) -> str:
     digest = hashlib.sha256(sentence.encode()).hexdigest()[:16]
-    return f"sentence:{digest}"
+    # Sanitise session_id — remove spaces and special chars
+    safe_session = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)[:32]
+    return f"sentence:{safe_session}:{digest}"
 
 
-def store_sentence(r: Redis, sentence: str, vec: np.ndarray, ttl: int) -> None:
-    key = redis_key(sentence)
+# ---------------------------------------------------------------------------
+# FIX 4: Sliding TTL — store with expiry, refresh on every cache hit
+# ---------------------------------------------------------------------------
+def store_sentence(
+    r: Redis, sentence: str, vec: np.ndarray,
+    ttl: int, session_id: str
+) -> None:
+    key = redis_key(sentence, session_id)
     mapping = {
         "sentence_id": str(uuid.uuid4()),
-        "text": sentence,
-        "embedding": vec_to_bytes(vec),
+        "session_id":  session_id,
+        "text":        sentence,
+        "embedding":   vec_to_bytes(vec),
     }
     r.hset(key, mapping=mapping)
     r.expire(key, ttl)
-    log.debug("  [STORE] key=%s  sentence='%.60s'", key, sentence)
+    log.debug("  [STORE] key=%s", key)
 
 
-def search_similar(r: Redis, vec: np.ndarray, k: int = 1) -> List[dict]:
+def refresh_ttl(r: Redis, key: str, ttl: int) -> None:
+    """Sliding TTL — reset expiry on every cache hit."""
+    r.expire(key, ttl)
+    log.debug("  [TTL REFRESH] key=%s  new_ttl=%ds", key, ttl)
+
+
+# ---------------------------------------------------------------------------
+# FIX 1: Session-scoped vector search
+# ---------------------------------------------------------------------------
+def search_similar(
+    r: Redis, vec: np.ndarray, session_id: str, k: int = 1
+) -> List[dict]:
+    """
+    Search only within the current session's cached sentences.
+    Uses key prefix filter: sentence:<session_id>:*
+    """
     query_bytes = vec_to_bytes(vec)
+    safe_session = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)[:32]
 
     try:
         raw = r.execute_command(
             "FT.SEARCH", settings.index_name,
-            "(*)=>[KNN 1 @embedding $query_vector AS score]",
+            f"(@session_id:{{{safe_session}}})=>[KNN 1 @embedding $query_vector AS score]",
             "PARAMS", "2",
             "query_vector", query_bytes,
             "SORTBY", "score", "ASC",
-            "RETURN", "2", "text", "score",
+            "RETURN", "3", "text", "score", "session_id",
             "DIALECT", "2",
             "LIMIT", "0", str(k),
         )
@@ -281,7 +327,6 @@ def search_similar(r: Redis, vec: np.ndarray, k: int = 1) -> List[dict]:
 
     if isinstance(raw, dict):
         total = raw.get(b"total_results", raw.get("total_results", 0))
-        log.info("        Dict response — total_results: %d", total)
         if total == 0:
             return []
 
@@ -301,9 +346,13 @@ def search_similar(r: Redis, vec: np.ndarray, k: int = 1) -> List[dict]:
             text = text_raw.decode() if isinstance(text_raw, bytes) else text_raw
 
             log.info(
-                "        MATCH → key=%s  distance=%.6f  similarity=%.6f  text='%.60s'",
-                key, raw_score, similarity, text,
+                "        MATCH → distance=%.6f  similarity=%.6f  text='%.60s'",
+                raw_score, similarity, text,
             )
+
+            # FIX 4: refresh TTL on cache hit
+            refresh_ttl(r, key, settings.context_ttl_seconds)
+
             docs.append({
                 "key": key,
                 "text": text,
@@ -333,9 +382,10 @@ def search_similar(r: Redis, vec: np.ndarray, k: int = 1) -> List[dict]:
             similarity = 1.0 - raw_score
             text = field_dict.get("text", "")
             log.info(
-                "        MATCH → key=%s  distance=%.6f  similarity=%.6f  text='%.60s'",
-                key, raw_score, similarity, text,
+                "        MATCH → distance=%.6f  similarity=%.6f  text='%.60s'",
+                raw_score, similarity, text,
             )
+            refresh_ttl(r, key, settings.context_ttl_seconds)
             docs.append({
                 "key": key,
                 "text": text,
@@ -347,9 +397,13 @@ def search_similar(r: Redis, vec: np.ndarray, k: int = 1) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Core compaction logic
+# Core compaction
 # ---------------------------------------------------------------------------
-async def compact_prompt(prompt: str) -> tuple[str, int, int, List[str], List[str]]:
+async def compact_prompt(
+    prompt: str,
+    session_id: str,
+    request_id: str,
+) -> Tuple[str, int, int, List[str], List[str]]:
     """
     Returns (final_prompt, original_chars, transmitted_chars, kept, dropped)
     """
@@ -357,47 +411,57 @@ async def compact_prompt(prompt: str) -> tuple[str, int, int, List[str], List[st
     sentences = split_sentences(prompt)
     original_chars = len(prompt)
 
-    log.info("─── Compaction start ───────────────────────────────")
-    log.info("Input sentences : %d", len(sentences))
-    log.info("Original chars  : %d", original_chars)
+    log.info("[%s] ─── Compaction start ───────────────────────────", request_id)
+    log.info("[%s] Session        : %s", request_id, session_id)
+    log.info("[%s] Input sentences: %d", request_id, len(sentences))
+    log.info("[%s] Original chars : %d", request_id, original_chars)
 
     kept: List[str] = []
     dropped: List[str] = []
 
     for i, sentence in enumerate(sentences):
-        log.info("  [%d/%d] Processing: '%.80s'", i + 1, len(sentences), sentence)
+        log.info("[%s]   [%d/%d] '%s'", request_id, i + 1, len(sentences), sentence[:80])
+
+        # FIX 3: short sentences bypass deduplication — always kept
+        if len(sentence) < settings.min_sentence_length:
+            log.info("[%s]         → KEPT  (too short to deduplicate — %d chars)",
+                     request_id, len(sentence))
+            kept.append(sentence)
+            continue
 
         vec = await encode_sentence(sentence)
 
         loop = asyncio.get_running_loop()
         matches = await loop.run_in_executor(
-            None, partial(search_similar, r, vec)
+            None, partial(search_similar, r, vec, session_id)
         )
 
-        log.info("        Search returned %d result(s).", len(matches))
+        log.info("[%s]         Search returned %d result(s).", request_id, len(matches))
 
         is_duplicate = False
         if matches:
             best = matches[0]
             log.info(
-                "        Best match → distance=%.6f  similarity=%.6f  "
-                "threshold_distance=%.4f  text='%.60s'",
-                best["distance"], best["similarity"],
+                "[%s]         Best → distance=%.6f  threshold=%.4f  text='%.50s'",
+                request_id, best["distance"],
                 settings.similarity_threshold, best["text"],
             )
             if best["distance"] <= settings.similarity_threshold:
                 is_duplicate = True
-                log.info("        → DROPPED  (duplicate / near-duplicate detected)")
+                log.info("[%s]         → DROPPED (near-exact duplicate)", request_id)
             else:
-                log.info("        → KEPT  (sufficiently different)")
+                log.info("[%s]         → KEPT  (different enough)", request_id)
         else:
-            log.info("        → KEPT  (no existing embeddings to compare against)")
+            log.info("[%s]         → KEPT  (nothing in session cache yet)", request_id)
 
         if not is_duplicate:
             kept.append(sentence)
             await loop.run_in_executor(
                 None,
-                partial(store_sentence, r, sentence, vec, settings.context_ttl_seconds),
+                partial(
+                    store_sentence, r, sentence, vec,
+                    settings.context_ttl_seconds, session_id
+                ),
             )
         else:
             dropped.append(sentence)
@@ -405,69 +469,70 @@ async def compact_prompt(prompt: str) -> tuple[str, int, int, List[str], List[st
     final_prompt = " ".join(kept)
     transmitted_chars = len(final_prompt)
 
-    log.info("Kept sentences   : %d / %d", len(kept), len(sentences))
-    log.info("Dropped sentences: %d / %d", len(dropped), len(sentences))
-    log.info("Transmitted chars: %d", transmitted_chars)
-    log.info("─── Compaction end ─────────────────────────────────")
+    log.info("[%s] Kept     : %d / %d", request_id, len(kept), len(sentences))
+    log.info("[%s] Dropped  : %d / %d", request_id, len(dropped), len(sentences))
+    log.info("[%s] ─── Compaction end ──────────────────────────────", request_id)
 
     return final_prompt, original_chars, transmitted_chars, kept, dropped
 
 
 # ---------------------------------------------------------------------------
-# Main endpoint — compact + stream
+# Main endpoint
 # ---------------------------------------------------------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     if not request.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt must not be empty.")
 
+    # FIX 7: unique request ID for tracing across logs
+    request_id = str(uuid.uuid4())[:8]
+    session_id = request.session_id or "default"
+
     t_start = time.perf_counter()
     final_prompt, original_chars, transmitted_chars, kept, dropped = \
-        await compact_prompt(request.prompt)
-    latency_ms = (time.perf_counter() - t_start) * 1000.0
+        await compact_prompt(request.prompt, session_id, request_id)
+    compaction_latency_ms = (time.perf_counter() - t_start) * 1000.0
 
     saved = original_chars - transmitted_chars
     savings_pct = (saved / original_chars * 100.0) if original_chars > 0 else 0.0
     status = "COMPACTED" if saved > 0 else "NO_REDUNDANCY"
 
     log.info(
-        "Compaction done → status=%s  savings=%.2f%%  latency=%.1fms",
-        status, savings_pct, latency_ms,
+        "[%s] status=%s  savings=%.2f%%  latency=%.1fms  session=%s",
+        request_id, status, savings_pct, compaction_latency_ms, session_id,
     )
 
-    # If stream=False return JSON only (no LLM call)
+    # Non-streaming mode — return JSON only
     if not request.stream:
         return ChatCompletionResponse(
+            request_id=request_id,
+            session_id=session_id,
             gateway_status=status,
             original_chars=original_chars,
             transmitted_chars=transmitted_chars,
             savings_percentage=round(savings_pct, 2),
-            latency_ms=round(latency_ms, 2),
+            compaction_latency_ms=round(compaction_latency_ms, 2),
             final_prompt_sent=final_prompt,
         )
 
-    # If compacted prompt is empty nothing to send to LLM
+    # FIX 5: always send something to LLM — use original if compacted is empty
+    prompt_to_send = final_prompt.strip() if final_prompt.strip() else request.prompt
     if not final_prompt.strip():
-        return ChatCompletionResponse(
-            gateway_status=status,
-            original_chars=original_chars,
-            transmitted_chars=0,
-            savings_percentage=round(savings_pct, 2),
-            latency_ms=round(latency_ms, 2),
-            final_prompt_sent="",
-        )
+        log.info("[%s] Compacted empty — using original prompt for LLM answer.", request_id)
 
-    # Stream compacted prompt to Gemini and pipe SSE back to user
     metadata = {
-        "gateway_status":    status,
-        "savings_percentage": round(savings_pct, 2),
-        "original_chars":    original_chars,
-        "transmitted_chars": transmitted_chars,
-        "dropped_content":   " ".join(dropped),
+        "request_id":          request_id,
+        "session_id":          session_id,
+        "gateway_status":      status,
+        "savings_percentage":  round(savings_pct, 2),
+        "original_chars":      original_chars,
+        "transmitted_chars":   transmitted_chars,
+        "dropped_content":     " ".join(dropped),
+        "compaction_latency_ms": round(compaction_latency_ms, 2),
     }
 
     return StreamingResponse(
-        gemini_stream(final_prompt, request.temperature, metadata),
+        groq_stream(prompt_to_send, request.temperature, metadata),
         media_type="text/event-stream",
         headers={
             "Cache-Control":               "no-cache",
@@ -478,7 +543,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health() -> dict:
@@ -490,9 +555,14 @@ async def health() -> dict:
     except Exception:
         pass
     return {
-        "status":       "ok" if redis_ok else "degraded",
-        "redis":        redis_ok,
-        "model_loaded": app_state.model is not None,
-        "gemini_key":   bool(settings.gemini_api_key),
-        "version":      "2.0.0",
+        "status":            "ok" if redis_ok else "degraded",
+        "version":           "2.1.0",
+        "redis":             redis_ok,
+        "model_loaded":      app_state.model is not None,
+        "llm_model":         settings.groq_model,
+        "llm_base_url":      settings.groq_base_url,
+        "api_key_set":       bool(settings.groq_api_key),
+        "threshold":         settings.similarity_threshold,
+        "min_sentence_len":  settings.min_sentence_length,
+        "cache_ttl_seconds": settings.context_ttl_seconds,
     }
