@@ -1,14 +1,20 @@
-# Secrets — never commit
-.env
-
 # Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
 *.egg-info/
 dist/
 build/
+
+# Environment — never bake secrets into image
+.env
+
+# Git
+.git/
+.gitignore
 
 # Logs
 *.log
