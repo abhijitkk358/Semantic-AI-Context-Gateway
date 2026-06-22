@@ -36,8 +36,10 @@ from redis.commands.search.query import Query
 from sentence_transformers import SentenceTransformer
 
 from app.config import settings
+from app.routers.ratelimit import check_rate_limit
 from app.routers.stream import StreamRequest, groq_stream, router as stream_router
-
+from app.routers.ratelimit import check_rate_limit
+from app.routers.metrics import record_request_metrics, router as metrics_router
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -198,6 +200,7 @@ app = FastAPI(
 )
 
 app.include_router(stream_router)
+app.include_router(metrics_router)
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +490,32 @@ async def chat_completions(request: ChatCompletionRequest):
     # FIX 7: unique request ID for tracing across logs
     request_id = str(uuid.uuid4())[:8]
     session_id = request.session_id or "default"
+	
+    # Phase 3 — Rate limiting
+    rate = check_rate_limit(app_state.redis, session_id)
+    if not rate["allowed"]:
+        from fastapi import Response
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error":       "rate_limit_exceeded",
+                "message":     f"Too many requests. You have sent {rate['current']} requests in {rate['window']}s. Limit is {rate['limit']}.",
+                "retry_after": rate["retry_after"],
+                "session_id":  session_id,
+            },
+            headers={
+                "Retry-After":              str(rate["retry_after"]),
+                "X-RateLimit-Limit":        str(rate["limit"]),
+                "X-RateLimit-Remaining":    "0",
+                "X-RateLimit-Reset":        str(rate["retry_after"]),
+            },
+        )
 
+    log.info(
+        "[%s] Rate limit OK  %d/%d requests used  %ds window remaining",
+        request_id, rate["current"], rate["limit"], rate["retry_after"] or rate["window"],
+    )	
     t_start = time.perf_counter()
     final_prompt, original_chars, transmitted_chars, kept, dropped = \
         await compact_prompt(request.prompt, session_id, request_id)
@@ -501,9 +529,30 @@ async def chat_completions(request: ChatCompletionRequest):
         "[%s] status=%s  savings=%.2f%%  latency=%.1fms  session=%s",
         request_id, status, savings_pct, compaction_latency_ms, session_id,
     )
-
-    # Non-streaming mode — return JSON only
+# Non-streaming mode — return JSON only
     if not request.stream:
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("cl100k_base")
+            tokens_used  = len(enc.encode(final_prompt)) if final_prompt else 0
+            tokens_saved = len(enc.encode(" ".join(dropped))) if dropped else 0
+        except Exception:
+            tokens_used  = len(final_prompt) // 4
+            tokens_saved = sum(len(s) for s in dropped) // 4
+
+        record_request_metrics(
+            r=app_state.redis,
+            request_id=request_id,
+            session_id=session_id,
+            gateway_status=status,
+            original_chars=original_chars,
+            transmitted_chars=transmitted_chars,
+            savings_pct=savings_pct,
+            tokens_used=tokens_used,
+            tokens_saved=tokens_saved,
+            compaction_latency_ms=compaction_latency_ms,
+        )
+
         return ChatCompletionResponse(
             request_id=request_id,
             session_id=session_id,
@@ -531,6 +580,31 @@ async def chat_completions(request: ChatCompletionRequest):
         "compaction_latency_ms": round(compaction_latency_ms, 2),
     }
 
+   # Record metrics before streaming
+    # tokens_used and tokens_saved estimated from char counts
+    # (exact token counts come from the stream done event)
+    import tiktoken
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")
+        tokens_used  = len(enc.encode(prompt_to_send))
+        tokens_saved = len(enc.encode(" ".join(dropped))) if dropped else 0
+    except Exception:
+        tokens_used  = len(prompt_to_send) // 4
+        tokens_saved = sum(len(s) for s in dropped) // 4
+
+    record_request_metrics(
+        r=app_state.redis,
+        request_id=request_id,
+        session_id=session_id,
+        gateway_status=status,
+        original_chars=original_chars,
+        transmitted_chars=transmitted_chars,
+        savings_pct=savings_pct,
+        tokens_used=tokens_used,
+        tokens_saved=tokens_saved,
+        compaction_latency_ms=compaction_latency_ms,
+    )
+
     return StreamingResponse(
         groq_stream(prompt_to_send, request.temperature, metadata),
         media_type="text/event-stream",
@@ -540,7 +614,6 @@ async def chat_completions(request: ChatCompletionRequest):
             "Access-Control-Allow-Origin": "*",
         },
     )
-
 
 # ---------------------------------------------------------------------------
 # Health
@@ -564,5 +637,7 @@ async def health() -> dict:
         "api_key_set":       bool(settings.groq_api_key),
         "threshold":         settings.similarity_threshold,
         "min_sentence_len":  settings.min_sentence_length,
-        "cache_ttl_seconds": settings.context_ttl_seconds,
+        "cache_ttl_seconds":    settings.context_ttl_seconds,
+        "rate_limit_requests":  50,
+        "rate_limit_window_sec": 60,
     }
