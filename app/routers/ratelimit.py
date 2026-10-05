@@ -9,7 +9,6 @@ Strategy: Redis INCR + EXPIRE
 - On subsequent requests: increment only (expiry already set)
 - On limit breach: return 429 with retry-after header
 
-Why sliding window over fixed window:
 Fixed window resets at :00 every minute — a user can send
 50 requests at :59 and 50 more at :01 = 100 in 2 seconds.
 Sliding window always looks back exactly 60 seconds from NOW.
