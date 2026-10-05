@@ -1,0 +1,37 @@
+# ── Terminal 1 — Redis ────────────────────────────────────────────
+cd ~/Projects/semantic_api_gateway
+docker compose up semantic-redis-cache
+
+# ── Terminal 2 — Gateway ──────────────────────────────────────────
+cd ~/Projects/semantic_api_gateway
+source venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# ── Browser ───────────────────────────────────────────────────────
+# Open: http://localhost:8000
+
+# ── Terminal 3 — Test commands ────────────────────────────────────
+
+# Health check
+curl -s http://localhost:8000/health | python3 -m json.tool
+
+# First call — seeds cache
+curl -s -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Machine learning is a subset of AI. What is deep learning?","stream":false,"session_id":"demo"}' \
+  | python3 -m json.tool
+
+# Second call — compaction fires
+curl -s -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Machine learning is a subset of AI. What are neural networks?","stream":false,"session_id":"demo"}' \
+  | python3 -m json.tool
+
+# Metrics
+curl -s http://localhost:8000/v1/metrics | python3 -m json.tool
+
+# Rate limit test
+for i in {1..55}; do curl -s -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"test","stream":false,"session_id":"ratelimitdemo"}' \
+  | python3 -m json.tool; done
